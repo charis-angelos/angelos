@@ -1,0 +1,6 @@
+chain.json
+.env
+memory/
+*.log
+.claude/
+target/

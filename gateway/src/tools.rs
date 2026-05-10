@@ -1,0 +1,313 @@
+use rig::{
+    completion::ToolDefinition,
+    tool::Tool,
+};
+use serde::Deserialize;
+
+use crate::memory;
+
+// ── ReadMemory tool ──
+
+#[derive(Deserialize)]
+pub struct ReadArgs {
+    path: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Read error: {0}")]
+pub struct ReadError(#[from] anyhow::Error);
+
+pub struct ReadMemory;
+
+impl Tool for ReadMemory {
+    const NAME: &'static str = "read_memory";
+
+    type Error = ReadError;
+    type Args = ReadArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Read a Markdown memory file. Path is relative to the memory directory.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the .md file, e.g. daily/2026-05-09.md"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(memory::read_memory(&args.path)?)
+    }
+}
+
+// ── WriteMemory tool ──
+
+#[derive(Deserialize)]
+pub struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Write error: {0}")]
+pub struct WriteError(#[from] anyhow::Error);
+
+pub struct WriteMemory;
+
+impl Tool for WriteMemory {
+    const NAME: &'static str = "write_memory";
+
+    type Error = WriteError;
+    type Args = WriteArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Atomically write content to a Markdown memory file. Creates parent directories automatically. Path is relative to the memory directory.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to write, e.g. tasks/pending.md"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full Markdown content to write"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        memory::write_memory(&args.path, &args.content)?;
+        Ok(format!("Written to {}", args.path))
+    }
+}
+
+// ── UpdateTask tool ──
+
+#[derive(Deserialize)]
+pub struct UpdateTaskArgs {
+    /// Line to find (partial match) and the new status
+    search: String,
+    status: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Task update error: {0}")]
+pub struct UpdateTaskError(#[from] anyhow::Error);
+
+pub struct UpdateTask;
+
+impl Tool for UpdateTask {
+    const NAME: &'static str = "update_task";
+
+    type Error = UpdateTaskError;
+    type Args = UpdateTaskArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Update a task's status in tasks/pending.md. Searches for a line containing the search text and replaces `[ ]` with `[x]` (or vice versa if status is 'undo'). Status must be 'done' or 'undo'.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": "Text to find in the pending task line"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["done", "undo"],
+                        "description": "'done' marks complete, 'undo' unmarks"
+                    }
+                },
+                "required": ["search", "status"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let content = memory::read_memory("tasks/pending.md")?;
+        let mut updated = content.clone();
+        match args.status.as_str() {
+            "done" => {
+                for line in content.lines() {
+                    if line.contains(&args.search) && line.contains("[ ]") {
+                        let new_line = line.replacen("[ ]", "[x]", 1);
+                        updated = updated.replace(line, &new_line);
+                        break;
+                    }
+                }
+            }
+            "undo" => {
+                for line in content.lines() {
+                    if line.contains(&args.search) && line.contains("[x]") {
+                        let new_line = line.replacen("[x]", "[ ]", 1);
+                        updated = updated.replace(line, &new_line);
+                        break;
+                    }
+                }
+            }
+            _ => return Err(UpdateTaskError(anyhow::anyhow!("Invalid status: {}", args.status))),
+        }
+        memory::write_memory("tasks/pending.md", &updated)?;
+        Ok(format!("Task matching '{}' updated to status '{}'", args.search, args.status))
+    }
+}
+
+// ── SearchMemory tool ──
+
+#[derive(Deserialize)]
+pub struct SearchArgs {
+    query: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Search error: {0}")]
+pub struct SearchError(#[from] anyhow::Error);
+
+pub struct SearchMemory;
+
+impl Tool for SearchMemory {
+    const NAME: &'static str = "search_memory";
+
+    type Error = SearchError;
+    type Args = SearchArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Search all memory files for a keyword. Returns matching file paths and content snippets.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to search for"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let results = memory::search_memory(&args.query)?;
+        if results.is_empty() {
+            Ok("No matches found.".into())
+        } else {
+            let formatted: Vec<String> = results
+                .iter()
+                .map(|m| format!("## {}\n{}", m.path, m.snippet))
+                .collect();
+            Ok(formatted.join("\n\n---\n\n"))
+        }
+    }
+}
+
+// ── RunBash tool ──
+
+#[derive(Deserialize)]
+pub struct RunBashArgs {
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Bash error: {0}")]
+pub struct BashError(String);
+
+pub struct RunBash;
+
+impl Tool for RunBash {
+    const NAME: &'static str = "run_bash";
+
+    type Error = BashError;
+    type Args = RunBashArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Execute a bash command and return stdout+stderr. \
+                Runs from the workspace directory. Max output 8KB. \
+                Use for system operations: check disk, list files, run scripts, etc. \
+                Avoid destructive commands (rm -rf, etc)."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (default 30)"
+                    }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let timeout = args.timeout_secs.unwrap_or(30).min(120);
+        let work_dir = std::env::var("MEMORY_DIR").unwrap_or_else(|_| "./memory".to_string());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout),
+            tokio::process::Command::new("bash")
+                .args(["-c", &args.command])
+                .current_dir(&work_dir)
+                .output(),
+        )
+        .await
+        .map_err(|_| BashError("Command timed out".into()));
+
+        match result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut combined = String::new();
+                if !stdout.is_empty() {
+                    combined.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str("--- stderr ---\n");
+                    combined.push_str(&stderr);
+                }
+                if combined.is_empty() {
+                    combined = format!("Command exited with code {:?}", output.status.code());
+                }
+                // Truncate to ~8KB
+                if combined.len() > 8192 {
+                    combined.truncate(8192);
+                    combined.push_str("\n... (output truncated)");
+                }
+                Ok(combined)
+            }
+            Ok(Err(e)) => Err(BashError(format!("Failed to execute: {e}"))),
+            Err(e) => Err(e),
+        }
+    }
+}

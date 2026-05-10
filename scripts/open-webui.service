@@ -1,0 +1,15 @@
+[Unit]
+Description=Open WebUI
+After=network-online.target angelos-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/open-webui serve --host 0.0.0.0 --port 3000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
