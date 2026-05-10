@@ -3,12 +3,12 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
-        Sse,
+        IntoResponse, Sse,
     },
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
@@ -20,7 +20,6 @@ use crate::agent::ModelChain;
 pub struct ChatCompletionRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub stream: bool,
     #[serde(default)]
     #[allow(dead_code)]
@@ -32,6 +31,8 @@ pub struct Message {
     pub role: String,
     pub content: Option<String>,
 }
+
+// ── Streaming (SSE) response types ──
 
 #[derive(Serialize)]
 struct ChatCompletionChunk {
@@ -53,6 +54,30 @@ struct ChoiceDelta {
 struct DeltaContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+}
+
+// ── Non-streaming (JSON) response types ──
+
+#[derive(Serialize)]
+struct NonStreamingResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<NonStreamingChoice>,
+}
+
+#[derive(Serialize)]
+struct NonStreamingChoice {
+    index: u32,
+    message: ResponseMessage,
+    finish_reason: String,
+}
+
+#[derive(Serialize)]
+struct ResponseMessage {
+    role: String,
+    content: String,
 }
 
 // ── App state ──
@@ -106,35 +131,22 @@ async fn health() -> &'static str {
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // Extract the latest user message as prompt
+) -> Result<axum::response::Response, StatusCode> {
     let user_msg = req
         .messages
         .iter()
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.as_deref())
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
-    // Build preamble + inject prior chat messages as context
+    if user_msg.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let preamble = build_preamble(&state.soul, &req.messages);
-
-    let response = match tokio::time::timeout(
-        Duration::from_secs(120),
-        state.chain.prompt(user_msg, &preamble),
-    )
-    .await
-    {
-        Ok(Ok(text)) => text,
-        Ok(Err(e)) => {
-            tracing::error!("LLM error: {e}");
-            return Err(StatusCode::BAD_GATEWAY);
-        }
-        Err(_) => {
-            tracing::error!("LLM timeout");
-            return Err(StatusCode::GATEWAY_TIMEOUT);
-        }
-    };
 
     let model = state
         .chain
@@ -149,15 +161,106 @@ async fn chat_completions(
         .unwrap()
         .as_secs();
 
-    // Build SSE stream: emit content chunks then done
-    let stream = sse_stream(response, id, model, created);
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    if req.stream {
+        let token_stream = match tokio::time::timeout(
+            Duration::from_secs(600),
+            async { state.chain.prompt_streaming(&user_msg, &preamble) },
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(_) => {
+                tracing::error!("LLM streaming timeout");
+                return Err(StatusCode::GATEWAY_TIMEOUT);
+            }
+        };
+
+        let stream = token_stream
+            .map(move |result| match result {
+                Ok(token) => {
+                    let chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![ChoiceDelta {
+                            index: 0,
+                            delta: DeltaContent {
+                                content: Some(token),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    Ok(Event::default()
+                        .data(serde_json::to_string(&chunk).unwrap_or_default()))
+                }
+                Err(e) => {
+                    tracing::error!("Stream error: {e}");
+                    let chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![ChoiceDelta {
+                            index: 0,
+                            delta: DeltaContent {
+                                content: Some(format!("\n\n[Error: {e}]")),
+                            },
+                            finish_reason: Some("stop".into()),
+                        }],
+                    };
+                    Ok(Event::default()
+                        .data(serde_json::to_string(&chunk).unwrap_or_default()))
+                }
+            })
+            .chain({
+                let done: Vec<Result<Event, Infallible>> =
+                    vec![Ok(Event::default().data("[DONE]"))];
+                futures::stream::iter(done)
+            });
+
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        let response_text = match tokio::time::timeout(
+            Duration::from_secs(120),
+            state.chain.prompt(&user_msg, &preamble),
+        )
+        .await
+        {
+            Ok(Ok(text)) => text,
+            Ok(Err(e)) => {
+                tracing::error!("LLM error: {e}");
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            Err(_) => {
+                tracing::error!("LLM timeout");
+                return Err(StatusCode::GATEWAY_TIMEOUT);
+            }
+        };
+
+        Ok(Json(NonStreamingResponse {
+            id,
+            object: "chat.completion".into(),
+            created,
+            model,
+            choices: vec![NonStreamingChoice {
+                index: 0,
+                message: ResponseMessage {
+                    role: "assistant".into(),
+                    content: response_text,
+                },
+                finish_reason: "stop".into(),
+            }],
+        })
+        .into_response())
+    }
 }
 
 fn build_preamble(soul: &str, messages: &[Message]) -> String {
     let mut preamble = crate::agent::build_full_preamble(soul);
 
-    // Inject prior conversation as context
     let prior: Vec<String> = messages
         .iter()
         .filter(|m| m.role != "system")
@@ -174,50 +277,6 @@ fn build_preamble(soul: &str, messages: &[Message]) -> String {
     }
 
     preamble
-}
-
-fn sse_stream(
-    text: String,
-    id: String,
-    model: String,
-    created: u64,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let chars: Vec<char> = text.chars().collect();
-    let chunk_size = 4usize; // chars per SSE event
-    let total = chars.len();
-
-    let events: Vec<Result<Event, Infallible>> = chars
-        .chunks(chunk_size)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let content: String = chunk.iter().collect();
-            let chunk_data = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".into(),
-                created,
-                model: model.clone(),
-                choices: vec![ChoiceDelta {
-                    index: 0,
-                    delta: DeltaContent {
-                        content: Some(content),
-                    },
-                    finish_reason: if i >= total.saturating_sub(1) / chunk_size {
-                        Some("stop".into())
-                    } else {
-                        None
-                    },
-                }],
-            };
-            Ok(Event::default()
-                .data(serde_json::to_string(&chunk_data).unwrap_or_default()))
-        })
-        .collect();
-
-    // Append [DONE] marker
-    let mut events = events;
-    events.push(Ok(Event::default().data("[DONE]")));
-
-    futures::stream::iter(events)
 }
 
 fn uuid_v4() -> String {

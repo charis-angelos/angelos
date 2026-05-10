@@ -10,14 +10,14 @@ echo "============================================"
 
 # ── 1. Build release binary ──
 echo ""
-echo "[1/5] Building gateway (release)..."
+echo "[1/6] Building gateway (release)..."
 cd "$ROOT/gateway"
 cargo build --release 2>&1 | tail -3
 cd "$ROOT"
 
 # ── 2. Create .env if missing ──
 echo ""
-echo "[2/5] Checking configuration..."
+echo "[2/6] Checking configuration..."
 if [ ! -f "$ROOT/.env" ]; then
     cp "$ROOT/.env.example" "$ROOT/.env"
     echo "  Created .env from .env.example — please review and adjust"
@@ -34,12 +34,12 @@ fi
 
 # ── 3. Install Open WebUI ──
 echo ""
-echo "[3/5] Installing Open WebUI (pip)..."
+echo "[3/6] Installing Open WebUI (pip)..."
 pip install open-webui 2>&1 | tail -3 || echo "  (if this failed, install manually: pip install open-webui)"
 
 # ── 4. Install systemd user units ──
 echo ""
-echo "[4/5] Installing systemd user units..."
+echo "[4/6] Installing systemd user units..."
 mkdir -p ~/.config/systemd/user/
 
 cp "$ROOT/scripts/angelos-gateway.service" ~/.config/systemd/user/
@@ -60,9 +60,14 @@ if command -v loginctl &>/dev/null; then
     sudo loginctl enable-linger "$USER" 2>/dev/null || echo "  (run 'sudo loginctl enable-linger $USER' manually if needed)"
 fi
 
-# ── 5. Set up cron ──
+# ── 5. Configure Open WebUI for Angelos ──
 echo ""
-echo "[5/5] Setting up cron job..."
+echo "[5/6] Configuring Open WebUI for Angelos..."
+python3 "$ROOT/scripts/configure-openwebui.py"
+
+# ── 6. Set up cron ──
+echo ""
+echo "[6/6] Setting up cron job..."
 CRON_LINE="0 9 * * * cd $ROOT && $ROOT/scripts/cron_daily.sh >> $ROOT/memory/logs/cron.log 2>&1"
 
 if crontab -l 2>/dev/null | grep -F "cron_daily.sh" >/dev/null; then

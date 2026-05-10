@@ -29,13 +29,13 @@ impl Tool for ReadMemory {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read a Markdown memory file. Path is relative to the memory directory.".into(),
+            description: "Read a Markdown memory file. Accepts absolute paths or paths relative to the memory directory.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to the .md file, e.g. daily/2026-05-09.md"
+                        "description": "Absolute path, or relative path to the .md file (e.g. daily/2026-05-09.md)"
                     }
                 },
                 "required": ["path"]
@@ -309,5 +309,138 @@ impl Tool for RunBash {
             Ok(Err(e)) => Err(BashError(format!("Failed to execute: {e}"))),
             Err(e) => Err(e),
         }
+    }
+}
+
+// ── Streaming path: raw tool definitions and dispatch ──
+
+/// OpenAI-format tool definitions for the streaming HTTP path.
+pub fn tool_definitions() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_memory",
+                "description": "Read a Markdown memory file. Accepts absolute paths or paths relative to the memory directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path, or relative path to the .md file (e.g. daily/2026-05-09.md)"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_memory",
+                "description": "Atomically write content to a Markdown memory file. Creates parent directories automatically. Path is relative to the memory directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to write, e.g. tasks/pending.md"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full Markdown content to write"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "update_task",
+                "description": "Update a task's status in tasks/pending.md. Searches for a line containing the search text and replaces `[ ]` with `[x]` (or vice versa if status is 'undo'). Status must be 'done' or 'undo'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "search": {
+                            "type": "string",
+                            "description": "Text to find in the pending task line"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["done", "undo"],
+                            "description": "'done' marks complete, 'undo' unmarks"
+                        }
+                    },
+                    "required": ["search", "status"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_memory",
+                "description": "Search all memory files for a keyword. Returns matching file paths and content snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Keyword or phrase to search for"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_bash",
+                "description": "Execute a bash command and return stdout+stderr. Runs from the workspace directory. Max output 8KB. Use for system operations: check disk, list files, run scripts, etc. Avoid destructive commands (rm -rf, etc).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute"
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds (default 30)"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+    ]
+}
+
+/// Execute a tool by name, given raw JSON arguments string.
+pub async fn execute_tool(name: &str, args: &str) -> anyhow::Result<String> {
+    match name {
+        "read_memory" => {
+            let args: ReadArgs = serde_json::from_str(args)?;
+            ReadMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        "write_memory" => {
+            let args: WriteArgs = serde_json::from_str(args)?;
+            WriteMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        "update_task" => {
+            let args: UpdateTaskArgs = serde_json::from_str(args)?;
+            UpdateTask.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        "search_memory" => {
+            let args: SearchArgs = serde_json::from_str(args)?;
+            SearchMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        "run_bash" => {
+            let args: RunBashArgs = serde_json::from_str(args)?;
+            RunBash.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        _ => anyhow::bail!("Unknown tool: {name}"),
     }
 }

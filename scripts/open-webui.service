@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=ENABLE_BASE_MODELS_CACHE=true
 ExecStart=%h/.local/bin/open-webui serve --host 0.0.0.0 --port 3000
 Restart=on-failure
 RestartSec=5

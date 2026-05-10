@@ -63,7 +63,7 @@ fn search_dir(dir: &Path, query: &str, results: &mut Vec<SearchMatch>) -> Result
         let path = entry.path();
         if path.is_dir() {
             search_dir(&path, query, results)?;
-        } else if path.extension().map_or(false, |e| e == "md") {
+        } else if path.extension().is_some_and(|e| e == "md") {
             let content = std::fs::read_to_string(&path)?;
             if content.to_lowercase().contains(&query.to_lowercase()) {
                 let rel = path

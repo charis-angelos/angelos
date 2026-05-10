@@ -28,9 +28,53 @@ fn parse_frontmatter(content: &str) -> Result<SkillMeta> {
     let end = body.find("\n---").context("No closing --- for frontmatter")?;
     let yaml = &body[..end];
 
-    let meta: SkillMeta = serde_yaml::from_str(yaml)
-        .with_context(|| "Failed to parse SKILL.md frontmatter")?;
-    Ok(meta)
+    // Try strict YAML parsing first
+    if let Ok(meta) = serde_yaml::from_str::<SkillMeta>(yaml) {
+        return Ok(meta);
+    }
+
+    // Fallback: lenient line-by-line extraction for malformed YAML
+    // (e.g. unquoted values containing colons)
+    parse_frontmatter_lenient(yaml).context("Failed to parse SKILL.md frontmatter (strict and lenient)")
+}
+
+/// Lenient fallback: extract name and description line-by-line.
+/// Handles common YAML issues like unquoted colons in description values.
+fn parse_frontmatter_lenient(yaml: &str) -> Option<SkillMeta> {
+    let mut name = None;
+    let mut description = None;
+
+    for line in yaml.lines() {
+        if let Some(v) = line.strip_prefix("name:").or_else(|| line.strip_prefix("name :")) {
+            name = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+    // Description may appear as plain scalar or quoted string
+    for line in yaml.lines() {
+        let desc = line
+            .strip_prefix("description:")
+            .or_else(|| line.strip_prefix("description :"));
+        if let Some(v) = desc {
+            let v = v.trim();
+            // Strip surrounding quotes if present
+            let v = if (v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\''))
+            {
+                &v[1..v.len() - 1]
+            } else {
+                v
+            };
+            if !v.is_empty() {
+                description = Some(v.to_string());
+            }
+            break;
+        }
+    }
+
+    match (name, description) {
+        (Some(n), Some(d)) => Some(SkillMeta { name: n, description: d }),
+        _ => None,
+    }
 }
 
 /// Scan a directory for subdirectories containing SKILL.md files.
@@ -61,11 +105,13 @@ fn scan_dir(root: &Path) -> Vec<Skill> {
                 continue;
             }
         };
+        let location = std::fs::canonicalize(&skill_md).unwrap_or_else(|_| skill_md.clone());
+        let dir = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         skills.push(Skill {
             name: meta.name,
             description: meta.description,
-            location: skill_md,
-            dir: path,
+            location,
+            dir,
         });
     }
 
@@ -105,9 +151,11 @@ pub fn build_catalog(skills: &[Skill]) -> String {
 
     let mut catalog = String::from("\n\n## Available Skills\n\n");
     catalog.push_str(
-        "When a task matches a skill's description, use `read_memory` to load its SKILL.md. \
-         The skill directory is the parent of the SKILL.md path. \
-         Use `run_bash` to execute scripts referenced by the skill.\n\n",
+        "When a task matches a skill's description, use `read_memory` with the exact absolute \
+         path from _location_ to load the SKILL.md before proceeding. \
+         Do not construct a relative path — copy the _location_ value verbatim. \
+         When a skill references relative paths, resolve them against the skill's directory \
+         (the parent of SKILL.md) and use absolute paths in tool calls.\n\n",
     );
 
     for s in skills {
