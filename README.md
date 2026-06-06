@@ -4,37 +4,47 @@ Local AI assistant with Markdown memory, powered by NVIDIA API (rig + Axum + Ope
 
 ## Quick Start
 
-### 1. Configure API keys
+### One-shot setup (recommended)
+```bash
+./scripts/setup.sh
+```
+This builds the gateway, creates config files (.env, chain.json, SOUL.md), installs Open WebUI in a local venv, sets up systemd services, and configures cron.
+
+### Manual setup
+
+#### 1. Configure API keys
 ```bash
 cp chain.json.example chain.json
 # Edit chain.json with your real API keys
 ```
 
-### 2. Set up environment
+#### 2. Set up environment
 ```bash
 cp .env.example .env
-# Adjust paths if needed
+cp SOUL.md.example SOUL.md
+# Adjust .env and SOUL.md as needed
 ```
 
-### 3. Build the gateway
+#### 3. Build the gateway
 ```bash
 cd gateway && cargo build --release
 ```
 
-### 4. Run CLI mode (test)
+#### 4. Run CLI mode (test)
 ```bash
 ./gateway/target/release/gateway --mode cron --prompt "你好，介绍一下你自己"
 ```
 
-### 5. Start HTTP gateway
+#### 5. Start HTTP gateway
 ```bash
 ./gateway/target/release/gateway --mode http --port 8000
 ```
 
-### 6. Install & start Open WebUI
+#### 6. Install & start Open WebUI
 ```bash
-pip install open-webui
-open-webui serve --host 127.0.0.1 --port 3000
+/usr/bin/python3.12 -m venv --system-site-packages .venv-openwebui
+.venv-openwebui/bin/pip install open-webui
+.venv-openwebui/bin/open-webui serve --host 127.0.0.1 --port 3000
 ```
 
 Then connect Open WebUI to `http://127.0.0.1:8000/v1` as a custom OpenAI endpoint.
@@ -42,6 +52,13 @@ Then connect Open WebUI to `http://127.0.0.1:8000/v1` as a custom OpenAI endpoin
 ### 7. Set up cron (daily tasks at 9 AM)
 ```bash
 (crontab -l; echo "0 9 * * * ~/angelos/scripts/cron_daily.sh") | crontab -
+```
+
+## Upgrading Open WebUI
+
+```bash
+.venv-openwebui/bin/pip install --upgrade open-webui
+systemctl --user restart open-webui
 ```
 
 ## Systemd Deployment
@@ -54,7 +71,7 @@ cp scripts/angelos-gateway.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now angelos-gateway
 
-# Open WebUI service
+# Open WebUI service (uses .venv-openwebui/bin/open-webui)
 cp scripts/open-webui.service ~/.config/systemd/user/
 systemctl --user enable --now open-webui
 

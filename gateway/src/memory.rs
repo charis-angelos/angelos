@@ -1,13 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-fn memory_dir() -> PathBuf {
-    std::env::var("MEMORY_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./memory"))
-}
-
-/// Resolve a relative path against MEMORY_DIR. Absolute paths pass through.
+/// Resolve a relative path against the repository root (current_dir).
+/// Absolute paths pass through.
 /// Security: rejects paths containing ".." to prevent directory traversal.
 pub fn resolve_path(path: &str) -> Result<PathBuf> {
     if path.contains("..") {
@@ -17,16 +12,17 @@ pub fn resolve_path(path: &str) -> Result<PathBuf> {
     if p.is_absolute() {
         Ok(p.to_path_buf())
     } else {
-        Ok(memory_dir().join(p))
+        let cwd = std::env::current_dir().context("Failed to get current directory")?;
+        Ok(cwd.join(p))
     }
 }
 
-pub fn read_memory(path: &str) -> Result<String> {
+pub fn read_self(path: &str) -> Result<String> {
     let full = resolve_path(path)?;
     Ok(std::fs::read_to_string(&full).unwrap_or_default())
 }
 
-pub fn write_memory(path: &str, content: &str) -> Result<()> {
+pub fn write_self(path: &str, content: &str) -> Result<()> {
     let full = resolve_path(path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)
@@ -46,18 +42,18 @@ pub struct SearchMatch {
     pub snippet: String,
 }
 
-pub fn search_memory(query: &str) -> Result<Vec<SearchMatch>> {
+pub fn search_self(query: &str) -> Result<Vec<SearchMatch>> {
     let mut results = Vec::new();
-    let base = memory_dir();
+    let base = std::env::current_dir().context("Failed to get current directory")?;
     if base.exists() {
         search_dir(&base, query, &mut results)?;
     }
-    // Sort by path for deterministic output
     results.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(results)
 }
 
 fn search_dir(dir: &Path, query: &str, results: &mut Vec<SearchMatch>) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -67,7 +63,7 @@ fn search_dir(dir: &Path, query: &str, results: &mut Vec<SearchMatch>) -> Result
             let content = std::fs::read_to_string(&path)?;
             if content.to_lowercase().contains(&query.to_lowercase()) {
                 let rel = path
-                    .strip_prefix(memory_dir())
+                    .strip_prefix(&cwd)
                     .unwrap_or(&path)
                     .display()
                     .to_string();
@@ -82,8 +78,8 @@ fn search_dir(dir: &Path, query: &str, results: &mut Vec<SearchMatch>) -> Result
 fn snippet_around(content: &str, query: &str, radius: usize) -> String {
     let lower = content.to_lowercase();
     if let Some(pos) = lower.find(&query.to_lowercase()) {
-        let start = pos.saturating_sub(radius / 2);
-        let end = (pos + query.len() + radius / 2).min(content.len());
+        let start = content.floor_char_boundary(pos.saturating_sub(radius / 2));
+        let end = content.ceil_char_boundary((pos + query.len() + radius / 2).min(content.len()));
         let snip = &content[start..end];
         let prefix = if start > 0 { "…" } else { "" };
         let suffix = if end < content.len() { "…" } else { "" };

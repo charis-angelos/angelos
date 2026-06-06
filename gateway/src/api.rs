@@ -83,13 +83,12 @@ struct ResponseMessage {
 // ── App state ──
 
 struct AppState {
-    soul: String,
     chain: ModelChain,
 }
 
-pub fn router(soul: String) -> Router {
+pub fn router() -> Router {
     let chain = ModelChain::from_env().expect("Failed to load chain config");
-    let state = Arc::new(AppState { soul, chain });
+    let state = Arc::new(AppState { chain });
 
     Router::new()
         .route("/health", get(health))
@@ -146,7 +145,7 @@ async fn chat_completions(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let preamble = build_preamble(&state.soul, &req.messages);
+    let preamble = build_preamble(&req.messages);
 
     let model = state
         .chain
@@ -162,18 +161,7 @@ async fn chat_completions(
         .as_secs();
 
     if req.stream {
-        let token_stream = match tokio::time::timeout(
-            Duration::from_secs(600),
-            async { state.chain.prompt_streaming(&user_msg, &preamble) },
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(_) => {
-                tracing::error!("LLM streaming timeout");
-                return Err(StatusCode::GATEWAY_TIMEOUT);
-            }
-        };
+        let token_stream = state.chain.prompt_streaming(&user_msg, &preamble);
 
         let stream = token_stream
             .map(move |result| match result {
@@ -225,7 +213,7 @@ async fn chat_completions(
     } else {
         let response_text = match tokio::time::timeout(
             Duration::from_secs(120),
-            state.chain.prompt(&user_msg, &preamble),
+            state.chain.prompt_light(&user_msg, &preamble),
         )
         .await
         {
@@ -258,8 +246,8 @@ async fn chat_completions(
     }
 }
 
-fn build_preamble(soul: &str, messages: &[Message]) -> String {
-    let mut preamble = crate::agent::build_full_preamble(soul);
+fn build_preamble(messages: &[Message]) -> String {
+    let mut preamble = crate::agent::build_full_preamble();
 
     let prior: Vec<String> = messages
         .iter()

@@ -1,0 +1,26 @@
+# Copy this file to open-webui.service and replace {{REPO_ROOT}} with the
+# absolute path to the angelos repository on your machine, e.g.:
+#
+#   sed -i "s|{{REPO_ROOT}}|$(pwd)|g" scripts/open-webui.service
+#
+# Then install:
+#   ln -s "$(pwd)/scripts/open-webui.service" ~/.config/systemd/user/open-webui.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now open-webui
+
+[Unit]
+Description=Open WebUI
+After=network-online.target angelos-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ENABLE_BASE_MODELS_CACHE=true
+ExecStart={{REPO_ROOT}}/.venv-openwebui/bin/open-webui serve --host 0.0.0.0 --port 3000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -66,11 +66,6 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let soul = std::fs::read_to_string(
-        std::env::var("SOUL_PATH").unwrap_or_else(|_| "./SOUL.md".to_string()),
-    )
-    .unwrap_or_else(|_| "You are a helpful personal assistant.".to_string());
-
     let mode = parse_args();
     tracing::info!("Gateway starting in {:?} mode", mode);
 
@@ -79,10 +74,10 @@ async fn main() -> anyhow::Result<()> {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             tracing::info!("Listening on {addr}");
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, api::router(soul)).await?;
+            axum::serve(listener, api::router()).await?;
         }
         Mode::Cron { prompt } => {
-            let result = agent::run_sync(prompt, soul).await?;
+            let result = agent::run_sync(prompt).await?;
             println!("{result}");
         }
     }

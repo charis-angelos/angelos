@@ -32,15 +32,30 @@ else
     echo "  chain.json exists"
 fi
 
+if [ ! -f "$ROOT/SOUL.md" ]; then
+    cp "$ROOT/SOUL.md.example" "$ROOT/SOUL.md"
+    echo "  Created SOUL.md from SOUL.md.example — customize as desired"
+else
+    echo "  SOUL.md exists"
+fi
+
 # ── 3. Install Open WebUI ──
 echo ""
-echo "[3/6] Installing Open WebUI (pip)..."
-pip install open-webui 2>&1 | tail -3 || echo "  (if this failed, install manually: pip install open-webui)"
+echo "[3/6] Installing Open WebUI (venv)..."
+OPENWEBUI_VENV="$ROOT/.venv-openwebui"
+if [ ! -d "$OPENWEBUI_VENV" ]; then
+    /usr/bin/python3.12 -m venv --system-site-packages "$OPENWEBUI_VENV"
+fi
+"$OPENWEBUI_VENV/bin/pip" install open-webui 2>&1 | tail -3 || echo "  (if this failed, install manually: $OPENWEBUI_VENV/bin/pip install open-webui)"
 
 # ── 4. Install systemd user units ──
 echo ""
 echo "[4/6] Installing systemd user units..."
 mkdir -p ~/.config/systemd/user/
+
+# Generate .service files from .example templates, substituting {{REPO_ROOT}}
+sed "s|{{REPO_ROOT}}|$ROOT|g" "$ROOT/scripts/angelos-gateway.service.example" > "$ROOT/scripts/angelos-gateway.service"
+sed "s|{{REPO_ROOT}}|$ROOT|g" "$ROOT/scripts/open-webui.service.example" > "$ROOT/scripts/open-webui.service"
 
 cp "$ROOT/scripts/angelos-gateway.service" ~/.config/systemd/user/
 cp "$ROOT/scripts/open-webui.service" ~/.config/systemd/user/
@@ -63,7 +78,7 @@ fi
 # ── 5. Configure Open WebUI for Angelos ──
 echo ""
 echo "[5/6] Configuring Open WebUI for Angelos..."
-python3 "$ROOT/scripts/configure-openwebui.py"
+"$OPENWEBUI_VENV/bin/python3" "$ROOT/scripts/configure-openwebui.py"
 
 # ── 6. Set up cron ──
 echo ""

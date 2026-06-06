@@ -151,7 +151,7 @@ pub fn build_catalog(skills: &[Skill]) -> String {
 
     let mut catalog = String::from("\n\n## Available Skills\n\n");
     catalog.push_str(
-        "When a task matches a skill's description, use `read_memory` with the exact absolute \
+        "When a task matches a skill's description, use `read_self` with the exact absolute \
          path from _location_ to load the SKILL.md before proceeding. \
          Do not construct a relative path — copy the _location_ value verbatim. \
          When a skill references relative paths, resolve them against the skill's directory \

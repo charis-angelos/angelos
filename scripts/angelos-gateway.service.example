@@ -1,0 +1,28 @@
+# Copy this file to angelos-gateway.service and replace {{REPO_ROOT}} with the
+# absolute path to the angelos repository on your machine, e.g.:
+#
+#   sed -i "s|{{REPO_ROOT}}|$(pwd)|g" scripts/angelos-gateway.service
+#
+# Then install:
+#   mkdir -p ~/.config/systemd/user
+#   ln -s "$(pwd)/scripts/angelos-gateway.service" ~/.config/systemd/user/angelos-gateway.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now angelos-gateway
+
+[Unit]
+Description=Angelos Gateway (OpenAI-compatible API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{REPO_ROOT}}
+EnvironmentFile={{REPO_ROOT}}/.env
+ExecStart={{REPO_ROOT}}/gateway/target/release/gateway --mode http --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

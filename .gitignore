@@ -1,6 +1,10 @@
 chain.json
 .env
 memory/
+SOUL.md
+scripts/*.service
 *.log
 .claude/
 target/
+.venv-openwebui/
+.webui_secret_key

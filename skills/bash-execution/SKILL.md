@@ -5,7 +5,7 @@ description: Execute bash commands for system operations — check disk, list fi
 
 ## Bash Execution
 
-You have access to a `run_bash` tool that executes shell commands in the workspace directory (the `$MEMORY_DIR`).
+You have access to a `run_bash` tool that executes shell commands from the repository root.
 
 ### When to Use This Skill
 
@@ -20,7 +20,7 @@ You have access to a `run_bash` tool that executes shell commands in the workspa
 
 - Max timeout: 120 seconds (default 30)
 - Max output: ~8KB (truncated beyond that)
-- The command runs from `$MEMORY_DIR`
+- The command runs from the repository root
 - Avoid destructive commands (`rm -rf`, `dd`, `mkfs`, etc.)
 - Avoid commands that modify system configuration without user confirmation
 

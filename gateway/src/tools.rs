@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::memory;
 
-// ── ReadMemory tool ──
+// ── ReadSelf tool ──
 
 #[derive(Deserialize)]
 pub struct ReadArgs {
@@ -17,10 +17,10 @@ pub struct ReadArgs {
 #[error("Read error: {0}")]
 pub struct ReadError(#[from] anyhow::Error);
 
-pub struct ReadMemory;
+pub struct ReadSelf;
 
-impl Tool for ReadMemory {
-    const NAME: &'static str = "read_memory";
+impl Tool for ReadSelf {
+    const NAME: &'static str = "read_self";
 
     type Error = ReadError;
     type Args = ReadArgs;
@@ -29,13 +29,13 @@ impl Tool for ReadMemory {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read a Markdown memory file. Accepts absolute paths or paths relative to the memory directory.".into(),
+            description: "Read a file from the workspace. Accepts absolute paths or paths relative to the repository root.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path, or relative path to the .md file (e.g. daily/2026-05-09.md)"
+                        "description": "Absolute path, or relative path to the file (e.g. memory/daily/2026-05-09.md)"
                     }
                 },
                 "required": ["path"]
@@ -44,11 +44,11 @@ impl Tool for ReadMemory {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Ok(memory::read_memory(&args.path)?)
+        Ok(memory::read_self(&args.path)?)
     }
 }
 
-// ── WriteMemory tool ──
+// ── WriteSelf tool ──
 
 #[derive(Deserialize)]
 pub struct WriteArgs {
@@ -60,10 +60,10 @@ pub struct WriteArgs {
 #[error("Write error: {0}")]
 pub struct WriteError(#[from] anyhow::Error);
 
-pub struct WriteMemory;
+pub struct WriteSelf;
 
-impl Tool for WriteMemory {
-    const NAME: &'static str = "write_memory";
+impl Tool for WriteSelf {
+    const NAME: &'static str = "write_self";
 
     type Error = WriteError;
     type Args = WriteArgs;
@@ -72,13 +72,13 @@ impl Tool for WriteMemory {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Atomically write content to a Markdown memory file. Creates parent directories automatically. Path is relative to the memory directory.".into(),
+            description: "Atomically write content to a file. Creates parent directories automatically. Path is relative to the repository root.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to write, e.g. tasks/pending.md"
+                        "description": "Relative path to write, e.g. memory/tasks/pending.md"
                     },
                     "content": {
                         "type": "string",
@@ -91,7 +91,7 @@ impl Tool for WriteMemory {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        memory::write_memory(&args.path, &args.content)?;
+        memory::write_self(&args.path, &args.content)?;
         Ok(format!("Written to {}", args.path))
     }
 }
@@ -141,7 +141,7 @@ impl Tool for UpdateTask {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let content = memory::read_memory("tasks/pending.md")?;
+        let content = memory::read_self("memory/tasks/pending.md")?;
         let mut updated = content.clone();
         match args.status.as_str() {
             "done" => {
@@ -164,12 +164,12 @@ impl Tool for UpdateTask {
             }
             _ => return Err(UpdateTaskError(anyhow::anyhow!("Invalid status: {}", args.status))),
         }
-        memory::write_memory("tasks/pending.md", &updated)?;
+        memory::write_self("memory/tasks/pending.md", &updated)?;
         Ok(format!("Task matching '{}' updated to status '{}'", args.search, args.status))
     }
 }
 
-// ── SearchMemory tool ──
+// ── SearchSelf tool ──
 
 #[derive(Deserialize)]
 pub struct SearchArgs {
@@ -180,10 +180,10 @@ pub struct SearchArgs {
 #[error("Search error: {0}")]
 pub struct SearchError(#[from] anyhow::Error);
 
-pub struct SearchMemory;
+pub struct SearchSelf;
 
-impl Tool for SearchMemory {
-    const NAME: &'static str = "search_memory";
+impl Tool for SearchSelf {
+    const NAME: &'static str = "search_self";
 
     type Error = SearchError;
     type Args = SearchArgs;
@@ -192,7 +192,7 @@ impl Tool for SearchMemory {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Search all memory files for a keyword. Returns matching file paths and content snippets.".into(),
+            description: "Search all Markdown files in the workspace for a keyword. Returns matching file paths and content snippets.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +207,7 @@ impl Tool for SearchMemory {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let results = memory::search_memory(&args.query)?;
+        let results = memory::search_self(&args.query)?;
         if results.is_empty() {
             Ok("No matches found.".into())
         } else {
@@ -269,7 +269,7 @@ impl Tool for RunBash {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let timeout = args.timeout_secs.unwrap_or(30).min(120);
-        let work_dir = std::env::var("MEMORY_DIR").unwrap_or_else(|_| "./memory".to_string());
+        let work_dir = ".".to_string();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout),
@@ -301,7 +301,8 @@ impl Tool for RunBash {
                 }
                 // Truncate to ~8KB
                 if combined.len() > 8192 {
-                    combined.truncate(8192);
+                    let end = combined.floor_char_boundary(8192);
+                    combined.truncate(end);
                     combined.push_str("\n... (output truncated)");
                 }
                 Ok(combined)
@@ -320,14 +321,14 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "read_memory",
-                "description": "Read a Markdown memory file. Accepts absolute paths or paths relative to the memory directory.",
+                "name": "read_self",
+                "description": "Read a file from the workspace. Accepts absolute paths or paths relative to the repository root.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path, or relative path to the .md file (e.g. daily/2026-05-09.md)"
+                            "description": "Absolute path, or relative path to the file (e.g. memory/daily/2026-05-09.md)"
                         }
                     },
                     "required": ["path"]
@@ -337,14 +338,14 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "write_memory",
-                "description": "Atomically write content to a Markdown memory file. Creates parent directories automatically. Path is relative to the memory directory.",
+                "name": "write_self",
+                "description": "Atomically write content to a file. Creates parent directories automatically. Path is relative to the repository root.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path to write, e.g. tasks/pending.md"
+                            "description": "Relative path to write, e.g. memory/tasks/pending.md"
                         },
                         "content": {
                             "type": "string",
@@ -359,7 +360,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "update_task",
-                "description": "Update a task's status in tasks/pending.md. Searches for a line containing the search text and replaces `[ ]` with `[x]` (or vice versa if status is 'undo'). Status must be 'done' or 'undo'.",
+                "description": "Update a task's status in memory/tasks/pending.md. Searches for a line containing the search text and replaces `[ ]` with `[x]` (or vice versa if status is 'undo'). Status must be 'done' or 'undo'.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -380,8 +381,8 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "search_memory",
-                "description": "Search all memory files for a keyword. Returns matching file paths and content snippets.",
+                "name": "search_self",
+                "description": "Search all Markdown files in the workspace for a keyword. Returns matching file paths and content snippets.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -421,26 +422,40 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
 /// Execute a tool by name, given raw JSON arguments string.
 pub async fn execute_tool(name: &str, args: &str) -> anyhow::Result<String> {
     match name {
-        "read_memory" => {
+        "read_self" => {
             let args: ReadArgs = serde_json::from_str(args)?;
-            ReadMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+            ReadSelf.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
         }
-        "write_memory" => {
+        "write_self" => {
             let args: WriteArgs = serde_json::from_str(args)?;
-            WriteMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+            WriteSelf.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
         }
         "update_task" => {
             let args: UpdateTaskArgs = serde_json::from_str(args)?;
             UpdateTask.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
         }
-        "search_memory" => {
+        "search_self" => {
             let args: SearchArgs = serde_json::from_str(args)?;
-            SearchMemory.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
+            SearchSelf.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
         }
         "run_bash" => {
             let args: RunBashArgs = serde_json::from_str(args)?;
             RunBash.call(args).await.map_err(|e| anyhow::anyhow!("{e}"))
         }
-        _ => anyhow::bail!("Unknown tool: {name}"),
+        _ => {
+            let defs = tool_definitions();
+            let available: Vec<&str> = defs
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str())
+                .collect();
+            anyhow::bail!(
+                "Tool '{name}' does not exist. Available tools: {available}.\n\
+                 If your task matches a skill in the Available Skills catalog (see system prompt), \
+                 load that skill via read_self first and follow its instructions.\n\
+                 If no available tool or skill fits the task, explain clearly what you cannot do \
+                 rather than guessing tool names.",
+                available = available.join(", "),
+            )
+        },
     }
 }
