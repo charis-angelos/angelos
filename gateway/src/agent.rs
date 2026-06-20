@@ -7,6 +7,183 @@ use tokio::sync::mpsc;
 
 use crate::tools::{ReadSelf, RunBash, SearchSelf, UpdateTask, WriteSelf};
 
+// ── SSE parsing helpers ──
+
+/// Result of parsing an SSE `data:` JSON line.
+struct ParsedDelta {
+    delta: serde_json::Value,
+    finish_reason: Option<String>,
+}
+
+/// Parse an SSE `data:` line into its delta object and optional finish_reason.
+fn parse_delta(data: &str) -> Option<ParsedDelta> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let choice = v.get("choices")?.as_array()?.first()?;
+    let delta = choice.get("delta")?.clone();
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .map(String::from);
+    Some(ParsedDelta {
+        delta,
+        finish_reason,
+    })
+}
+
+// ── Streaming output helper ──
+
+/// Manages the output channel, content buffer, and thinking-block toggle
+/// during SSE stream processing.
+struct StreamOutput<'a> {
+    tx: &'a mpsc::Sender<anyhow::Result<String>>,
+    content_buf: String,
+    thinking_open: bool,
+    has_actual_content: bool,
+}
+
+impl<'a> StreamOutput<'a> {
+    fn new(tx: &'a mpsc::Sender<anyhow::Result<String>>) -> Self {
+        Self {
+            tx,
+            content_buf: String::new(),
+            thinking_open: false,
+            has_actual_content: false,
+        }
+    }
+
+    /// Send reasoning content, opening the thinking block on first call.
+    /// Returns `Err(())` if the client disconnected.
+    async fn send_reasoning(&mut self, text: &str) -> Result<(), ()> {
+        if !self.thinking_open {
+            self.thinking_open = true;
+            let _ = self
+                .tx
+                .send(Ok("\n💭 **Thinking:**\n> ".into()))
+                .await;
+        }
+        let formatted = text.replace('\n', "\n> ");
+        self.content_buf.push_str(&formatted);
+        if self.tx.send(Ok(formatted)).await.is_err() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Send regular content, closing the thinking block if it was open.
+    /// Returns `Err(())` if the client disconnected.
+    async fn send_content(&mut self, text: &str) -> Result<(), ()> {
+        if self.thinking_open {
+            self.thinking_open = false;
+            let _ = self.tx.send(Ok("\n\n---\n\n".into())).await;
+        }
+        self.content_buf.push_str(text);
+        self.has_actual_content = true;
+        if self.tx.send(Ok(text.to_string())).await.is_err() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Returns true if no actual (non-reasoning) content has been received.
+    fn is_empty(&self) -> bool {
+        !self.has_actual_content
+    }
+
+    /// Log the accumulated content with char count and truncated preview.
+    fn log_success(&self, label: &str) {
+        let preview: String = self.content_buf.chars().take(200).collect();
+        let dots = if self.content_buf.len() > 200 { "…" } else { "" };
+        tracing::info!(
+            "{label}: response ({} chars): {preview}{dots}",
+            self.content_buf.len()
+        );
+    }
+}
+
+// ── Streaming request helpers ──
+
+/// Announce the current model through the channel, prefixing with "🔄 Switched to"
+/// when transitioning between models.
+async fn announce_model(
+    last_model: &mut Option<String>,
+    model: &str,
+    tx: &mpsc::Sender<anyhow::Result<String>>,
+) {
+    if last_model.as_deref() != Some(model) {
+        let label = if last_model.is_some() {
+            format!("\n\n🔄 Switched to **Model: {}**\n\n", model)
+        } else {
+            format!("**Model: {}**\n\n", model)
+        };
+        *last_model = Some(model.to_string());
+        let _ = tx.send(Ok(label)).await;
+    }
+}
+
+/// POST a streaming chat/completions request with timeout and error handling.
+/// Returns the response on success, or `None` if this provider should be skipped.
+async fn post_streaming_request(
+    http: &reqwest::Client,
+    entry: &ProviderEntry,
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    temperature: f64,
+    label: &str,
+) -> Option<reqwest::Response> {
+    let url = format!(
+        "{}/chat/completions",
+        entry.base_url.trim_end_matches('/')
+    );
+    let mut body = json!({
+        "model": entry.model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 4096,
+        "stream": true,
+    });
+    if let Some(t) = tools {
+        body["tools"] = json!(t);
+        body["frequency_penalty"] = json!(0.3);
+    }
+
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        http.post(&url)
+            .header("Authorization", format!("Bearer {}", entry.api_key))
+            .json(&body)
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "{label} {}/{} HTTP send failed: {e}",
+                entry.base_url,
+                entry.model
+            );
+            return None;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "{label} {}/{} first-byte timeout (30s)",
+                entry.base_url,
+                entry.model
+            );
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        tracing::warn!("{label} {}/{} HTTP {status}: {text}", entry.base_url, entry.model);
+        return None;
+    }
+
+    Some(response)
+}
+
 // ── Provider chain config ──
 
 #[derive(Deserialize, Clone)]
@@ -14,6 +191,76 @@ pub struct ProviderEntry {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+}
+
+/// Build a lightweight agent (no tools, low temperature) for prompt_light
+/// and fallback summary one-shot calls. Preamble and max_tokens vary by
+/// call site.
+fn build_light_agent(
+    entry: &ProviderEntry,
+    preamble: Option<&str>,
+    max_tokens: u64,
+) -> rig::agent::Agent<openai::CompletionModel> {
+    let mut builder = openai::Client::from_url(&entry.api_key, &entry.base_url)
+        .agent(&entry.model)
+        .temperature(0.3)
+        .max_tokens(max_tokens);
+    if let Some(p) = preamble {
+        builder = builder.preamble(p);
+    }
+    builder.build()
+}
+
+/// Execute a single non-streaming completion against a light agent,
+/// handling errors, empty responses, and unexpected choices. Returns
+/// `Some(msg)` on success, or `None` to signal "try next provider."
+/// Always captures the last error in `last_err` for debuggable
+/// exhaustion messages.
+async fn try_light_completion(
+    entry: &ProviderEntry,
+    label: &str,
+    agent: &rig::agent::Agent<openai::CompletionModel>,
+    prompt: &str,
+    chat_history: Vec<rig::completion::Message>,
+    last_err: &mut Option<anyhow::Error>,
+) -> Option<String> {
+    use rig::completion::{Completion, ModelChoice};
+
+    let builder = match agent.completion(prompt, chat_history).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("{label} {}/{} completion error: {e}", entry.base_url, entry.model);
+            *last_err = Some(e.into());
+            return None;
+        }
+    };
+
+    let response = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("{label} {}/{} send error: {e}", entry.base_url, entry.model);
+            *last_err = Some(e.into());
+            return None;
+        }
+    };
+
+    match response.choice {
+        ModelChoice::Message(msg) => {
+            let trimmed = msg.trim();
+            if trimmed.is_empty() {
+                tracing::warn!("{label} {}/{} returned empty message", entry.base_url, entry.model);
+                *last_err = Some(anyhow::anyhow!("empty response"));
+                return None;
+            }
+            tracing::info!("{label} via {}/{}: {} chars", entry.base_url, entry.model, msg.len());
+            Some(msg)
+        }
+        _ => {
+            tracing::warn!("{label} {}/{} returned unexpected choice", entry.base_url, entry.model);
+            *last_err = Some(anyhow::anyhow!("unexpected response type"));
+            None
+        }
+    }
 }
 
 /// Multi-provider chain with fallback. Iterates through providers in order
@@ -95,8 +342,6 @@ impl ModelChain {
     /// generation, suggestions, etc.). No tools, single completion, clean
     /// output — no model-name prefix. With provider failover.
     pub async fn prompt_light(&self, user_prompt: &str, preamble: &str) -> anyhow::Result<String> {
-        use rig::completion::{Completion, ModelChoice};
-
         let mut last_err = None;
 
         for (i, entry) in self.providers.iter().enumerate() {
@@ -108,47 +353,19 @@ impl ModelChain {
                 entry.base_url
             );
 
-            let agent = Self::make_client(entry)
-                .agent(&entry.model)
-                .preamble(preamble)
-                .temperature(0.3)
-                .max_tokens(2048)
-                .build();
+            let agent = build_light_agent(entry, Some(preamble), 2048);
 
-            let builder = match agent.completion(user_prompt, vec![]).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Light {}/{} completion error: {e}", entry.base_url, entry.model);
-                    last_err = Some(e.into());
-                    continue;
-                }
-            };
-
-            let response = match builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Light {}/{} send error: {e}", entry.base_url, entry.model);
-                    last_err = Some(e.into());
-                    continue;
-                }
-            };
-
-            match response.choice {
-                ModelChoice::Message(msg) => {
-                    let trimmed = msg.trim();
-                    if trimmed.is_empty() {
-                        tracing::warn!("Light {}/{} returned empty message", entry.base_url, entry.model);
-                        last_err = Some(anyhow::anyhow!("empty response"));
-                        continue;
-                    }
-                    tracing::info!("Light via {}/{}: {} chars", entry.base_url, entry.model, msg.len());
-                    return Ok(msg);
-                }
-                _ => {
-                    tracing::warn!("Light {}/{} returned unexpected choice", entry.base_url, entry.model);
-                    last_err = Some(anyhow::anyhow!("unexpected response type"));
-                    continue;
-                }
+            if let Some(msg) = try_light_completion(
+                entry,
+                "Light",
+                &agent,
+                user_prompt,
+                vec![],
+                &mut last_err,
+            )
+            .await
+            {
+                return Ok(msg);
             }
         }
 
@@ -216,64 +433,28 @@ impl ModelChain {
                     messages.len()
                 );
 
-                // Announce model switch BEFORE the HTTP request so the
-                // user sees it even if the provider takes 120s to time out.
-                if last_model.as_deref() != Some(&entry.model) {
-                    let label = if last_model.is_some() {
-                        format!("\n\n🔄 Switched to **Model: {}**\n\n", entry.model)
-                    } else {
-                        format!("**Model: {}**\n\n", entry.model)
-                    };
-                    last_model = Some(entry.model.clone());
-                    let _ = tx.send(Ok(label)).await;
-                }
+                announce_model(&mut last_model, &entry.model, tx).await;
 
-                let url = format!("{}/chat/completions", entry.base_url.trim_end_matches('/'));
-                let body = json!({
-                    "model": entry.model,
-                    "messages": messages,
-                    "tools": tools,
-                    "temperature": 0.7,
-                    "max_tokens": 4096,
-                    "frequency_penalty": 0.3,
-                    "stream": true,
-                });
-
-                let response = match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    http
-                        .post(&url)
-                        .header("Authorization", format!("Bearer {}", entry.api_key))
-                        .json(&body)
-                        .send(),
+                let response = match post_streaming_request(
+                    http,
+                    entry,
+                    messages,
+                    Some(&tools),
+                    0.7,
+                    &format!("[{round}]"),
                 )
                 .await
                 {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        tracing::warn!("[{round}] {}/{} HTTP send failed: {e}", entry.base_url, entry.model);
-                        continue;
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!("[{round}] {}/{} first-byte timeout (30s)", entry.base_url, entry.model);
-                        continue;
-                    }
+                    Some(r) => r,
+                    None => continue,
                 };
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let text = response.text().await.unwrap_or_default();
-                    tracing::warn!("[{round}] {}/{} HTTP {status}: {text}", entry.base_url, entry.model);
-                    continue; // try next provider
-                }
 
                 let mut stream = response.bytes_stream();
                 let mut line_buf = String::new();
                 let mut tool_bufs: std::collections::BTreeMap<usize, ToolCallAccum> =
                     std::collections::BTreeMap::new();
                 let mut finish_reason: Option<String> = None;
-                let mut content_buf = String::new();
-                let mut thinking_open = false;
+                let mut output = StreamOutput::new(tx);
 
                 // ── Parse SSE stream ──
                 'sse: loop {
@@ -329,23 +510,8 @@ impl ModelChain {
                             None => continue,
                         };
 
-                        let chunk_v: serde_json::Value = match serde_json::from_str(data) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        let choices = match chunk_v.get("choices").and_then(|c| c.as_array()) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-
-                        let choice = match choices.first() {
-                            Some(c) => c,
-                            None => continue,
-                        };
-
-                        let delta = match choice.get("delta") {
-                            Some(d) => d,
+                        let parsed = match parse_delta(data) {
+                            Some(p) => p,
                             None => continue,
                         };
 
@@ -353,35 +519,23 @@ impl ModelChain {
                         // (deepseek-v4-pro, qwen3-next-80b-a3b-thinking, kimi-k2.6)
                         // emit this before content. Without this, the stream
                         // completes with empty content_buf → fallback cascade.
-                        if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                        if let Some(rc) = parsed.delta.get("reasoning_content").and_then(|c| c.as_str()) {
                             if !rc.is_empty() {
-                                if !thinking_open {
-                                    thinking_open = true;
-                                    let _ = tx.send(Ok("\n💭 **Thinking:**\n> ".into())).await;
-                                }
-                                // Escape newlines in reasoning to keep blockquote
-                                let formatted = rc.replace('\n', "\n> ");
-                                content_buf.push_str(&formatted);
-                                if tx.send(Ok(formatted)).await.is_err() {
+                                if output.send_reasoning(rc).await.is_err() {
                                     return Ok(()); // client disconnected
                                 }
                             }
                         }
 
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                        if let Some(content) = parsed.delta.get("content").and_then(|c| c.as_str()) {
                             if !content.is_empty() {
-                                if thinking_open {
-                                    thinking_open = false;
-                                    let _ = tx.send(Ok("\n\n---\n\n".into())).await;
-                                }
-                                content_buf.push_str(content);
-                                if tx.send(Ok(content.to_string())).await.is_err() {
+                                if output.send_content(content).await.is_err() {
                                     return Ok(()); // client disconnected
                                 }
                             }
                         }
 
-                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        if let Some(tool_calls) = parsed.delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc_delta in tool_calls {
                                 let idx = tc_delta
                                     .get("index")
@@ -407,8 +561,8 @@ impl ModelChain {
                             }
                         }
 
-                        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                            finish_reason = Some(fr.to_string());
+                        if let Some(fr) = parsed.finish_reason {
+                            finish_reason = Some(fr);
                             break 'sse;
                         }
                     }
@@ -495,16 +649,11 @@ impl ModelChain {
                         break; // out of provider loop, continue to next round
                     }
                     Some("stop") => {
-                        if content_buf.trim().is_empty() {
+                        if output.is_empty() {
                             tracing::warn!("[{round}] {}/{} stream produced empty content — trying next provider", entry.base_url, entry.model);
                             continue;
                         }
-                        let preview: String = content_buf.chars().take(200).collect();
-                        let dots = if content_buf.len() > 200 { "…" } else { "" };
-                        tracing::info!(
-                            "[{round}] Success via {}/{}: response ({} chars): {}{}",
-                            entry.base_url, entry.model, content_buf.len(), preview, dots
-                        );
+                        output.log_success(&format!("[{round}] Success via {}/{}", entry.base_url, entry.model));
                         return Ok(());
                     }
                     Some("length") => {
@@ -574,66 +723,28 @@ impl ModelChain {
         let mut last_model: Option<String> = None;
 
         for (pi, entry) in providers.iter().enumerate() {
-            tracing::info!(
-                "Fallback [{}/{}]: {} @ {}",
-                pi + 1,
-                providers.len(),
-                entry.model,
-                entry.base_url
-            );
+            let label = format!("Fallback [{}/{}]", pi + 1, providers.len());
+            tracing::info!("{}: {} @ {}", label, entry.model, entry.base_url);
 
-            // Announce model switch BEFORE the HTTP request.
-            if last_model.as_deref() != Some(&entry.model) {
-                let label = if last_model.is_some() {
-                    format!("\n\n🔄 Switched to **Model: {}**\n\n", entry.model)
-                } else {
-                    format!("**Model: {}**\n\n", entry.model)
-                };
-                last_model = Some(entry.model.clone());
-                let _ = tx.send(Ok(label)).await;
-            }
+            announce_model(&mut last_model, &entry.model, tx).await;
 
-            let url = format!("{}/chat/completions", entry.base_url.trim_end_matches('/'));
-            let body = json!({
-                "model": entry.model,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": 4096,
-                "stream": true,
-            });
-
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                http
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", entry.api_key))
-                    .json(&body)
-                    .send(),
+            let response = match post_streaming_request(
+                http,
+                entry,
+                messages,
+                None,
+                0.3,
+                &label,
             )
             .await
             {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::warn!("Fallback {}/{} HTTP send failed: {e}", entry.base_url, entry.model);
-                    continue;
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("Fallback {}/{} first-byte timeout (30s)", entry.base_url, entry.model);
-                    continue;
-                }
+                Some(r) => r,
+                None => continue,
             };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                tracing::warn!("Fallback {}/{} HTTP {status}: {text}", entry.base_url, entry.model);
-                continue;
-            }
 
             let mut stream = response.bytes_stream();
             let mut line_buf = String::new();
-            let mut content_buf = String::new();
-            let mut thinking_open = false;
+            let mut output = StreamOutput::new(tx);
 
             loop {
                 let chunk_result = match tokio::time::timeout(
@@ -646,7 +757,7 @@ impl ModelChain {
                     Ok(Some(Err(e))) => Err(e),
                     Ok(None) => break, // stream ended cleanly
                     Err(_elapsed) => {
-                        tracing::warn!("Fallback {}/{} chunk timeout (30s)", entry.base_url, entry.model);
+                        tracing::warn!("{} {}/{} chunk timeout (30s)", label, entry.base_url, entry.model);
                         break;
                     }
                 };
@@ -654,7 +765,7 @@ impl ModelChain {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!("Fallback {}/{} stream error: {e}", entry.base_url, entry.model);
+                        tracing::warn!("{} {}/{} stream error: {e}", label, entry.base_url, entry.model);
                         break;
                     }
                 };
@@ -671,55 +782,36 @@ impl ModelChain {
                         Some(d) => d,
                         None => continue,
                     };
-                    let chunk_v: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let choice = chunk_v
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|c| c.first());
-                    let delta = match choice.and_then(|c| c.get("delta")) {
-                        Some(d) => d,
+                    let parsed = match parse_delta(data) {
+                        Some(p) => p,
                         None => continue,
                     };
-                    if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                    if let Some(rc) = parsed.delta.get("reasoning_content").and_then(|c| c.as_str()) {
                         if !rc.is_empty() {
-                            if !thinking_open {
-                                thinking_open = true;
-                                let _ = tx.send(Ok("\n💭 **Thinking:**\n> ".into())).await;
-                            }
-                            let formatted = rc.replace('\n', "\n> ");
-                            content_buf.push_str(&formatted);
-                            if tx.send(Ok(formatted)).await.is_err() {
+                            if output.send_reasoning(rc).await.is_err() {
                                 return Ok(());
                             }
                         }
                     }
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    if let Some(content) = parsed.delta.get("content").and_then(|c| c.as_str()) {
                         if !content.is_empty() {
-                            if thinking_open {
-                                thinking_open = false;
-                                let _ = tx.send(Ok("\n\n---\n\n".into())).await;
-                            }
-                            content_buf.push_str(content);
-                            if tx.send(Ok(content.to_string())).await.is_err() {
+                            if output.send_content(content).await.is_err() {
                                 return Ok(());
                             }
                         }
                     }
                 }
             }
-            if content_buf.trim().is_empty() {
-                tracing::warn!("Fallback {}/{} produced empty content", entry.base_url, entry.model);
+            if output.is_empty() {
+                tracing::warn!(
+                    "{} {}/{} produced empty content",
+                    label,
+                    entry.base_url,
+                    entry.model
+                );
                 continue;
             }
-            let preview: String = content_buf.chars().take(200).collect();
-            let dots = if content_buf.len() > 200 { "…" } else { "" };
-            tracing::info!(
-                "Fallback via {}/{}: response ({} chars): {}{}",
-                entry.base_url, entry.model, content_buf.len(), preview, dots
-            );
+            output.log_success(&label);
             return Ok(());
         }
 
@@ -826,6 +918,8 @@ impl ModelChain {
 
         tracing::warn!("Max tool call rounds (7) exceeded — attempting final summary");
 
+        let mut last_err = None;
+
         for (pi, entry) in providers.iter().enumerate() {
             tracing::info!(
                 "Fallback [{}/{}]: {} @ {}",
@@ -835,52 +929,25 @@ impl ModelChain {
                 entry.base_url
             );
 
-            let no_tool_agent = Self::make_client(entry)
-                .agent(&entry.model)
-                .temperature(0.3)
-                .max_tokens(4096)
-                .build();
+            let no_tool_agent = build_light_agent(entry, None, 4096);
 
-            let builder = match no_tool_agent
-                .completion(
-                    "Based on the conversation above, produce a final response.",
-                    chat_history.clone(),
-                )
-                .await
+            if let Some(msg) = try_light_completion(
+                entry,
+                "Fallback",
+                &no_tool_agent,
+                "Based on the conversation above, produce a final response.",
+                chat_history.clone(),
+                &mut last_err,
+            )
+            .await
             {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Fallback {}/{} completion error: {e}", entry.base_url, entry.model);
-                    continue;
-                }
-            };
-
-            let response = match builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Fallback {}/{} send error: {e}", entry.base_url, entry.model);
-                    continue;
-                }
-            };
-
-            match response.choice {
-                ModelChoice::Message(msg) => {
-                    if msg.trim().is_empty() {
-                        tracing::warn!("Fallback {}/{} returned empty message", entry.base_url, entry.model);
-                        continue;
-                    }
-                    tracing::info!("Fallback via {}/{}", entry.base_url, entry.model);
-                    return Ok((entry.model.clone(), msg));
-                }
-                _ => {
-                    tracing::warn!("Fallback {}/{} returned unexpected choice", entry.base_url, entry.model);
-                    continue;
-                }
+                return Ok((entry.model.clone(), msg));
             }
         }
 
         Err(anyhow::anyhow!(
-            "Max tool call rounds (7) exceeded and all final summaries failed"
+            "Max tool call rounds (7) exceeded and all final summaries failed. Last error: {:?}",
+            last_err.map(|e| e.to_string())
         ))
     }
 }
@@ -1592,6 +1659,18 @@ mod tests {
         .to_string()
     }
 
+    /// SSE body: reasoning_content only, then stop — no content delta.
+    /// Reproduces the DeepSeek/Qwen/Kimi empty-response bug where the model
+    /// produces thinking text but no actual answer.
+    fn sse_reasoning_only_no_content_body() -> String {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think about this.\"},\"index\":0}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string()
+    }
+
     /// SSE body with finish_reason only (no content delta).
     fn sse_finish_reason_only(reason: &str) -> String {
         format!(
@@ -1821,6 +1900,55 @@ mod tests {
         assert!(all.contains("**Thinking:**"));
         assert!(all.contains("Let me think about this"));
         assert!(all.contains("The answer is 42"));
+    }
+
+    #[tokio::test]
+    async fn streaming_reasoning_only_no_content_tries_next() {
+        // Provider 1: reasoning_content with stop, but NO content delta.
+        // This is the exact scenario that triggers the DeepSeek/Qwen/Kimi
+        // empty-response bug — reasoning models that think but produce no answer.
+        let reasoning_only = httpmock::MockServer::start();
+        let body = sse_reasoning_only_no_content_body();
+        reasoning_only.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(&body);
+        });
+
+        // Provider 2: normal content
+        let ok = httpmock::MockServer::start();
+        let body2 = sse_body(&[("recovered", Some("stop"))]);
+        ok.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(&body2);
+        });
+
+        let chain = ModelChain {
+            providers: vec![
+                ProviderEntry {
+                    model: "think-only".into(),
+                    base_url: reasoning_only.base_url(),
+                    api_key: "k".into(),
+                },
+                ProviderEntry {
+                    model: "ok".into(),
+                    base_url: ok.base_url(),
+                    api_key: "k".into(),
+                },
+            ],
+            http: reqwest::Client::builder().build().unwrap(),
+        };
+        let items = collect_stream(chain.prompt_streaming("hi", "preamble")).await;
+        let all = items.concat();
+        assert!(
+            all.contains("recovered"),
+            "Expected fallback to second provider when first produces only reasoning. Got: {all}"
+        );
     }
 
     #[tokio::test]
