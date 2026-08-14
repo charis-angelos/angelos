@@ -1,26 +1,31 @@
 [
   {
+    "model": "openai/gpt-oss-120b",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
+    "model": "google/gemma-4-31b-it",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
+    "model": "nvidia/nemotron-3-ultra-550b-a55b",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
     "model": "minimaxai/minimax-m3",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "minimaxai/minimax-m2.7",
+    "model": "z-ai/glm-5.2",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "z-ai/glm-5.1",
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-YOUR_KEY_HERE"
-  },
-  {
-    "model": "moonshotai/kimi-k2.6",
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-YOUR_KEY_HERE"
-  },
-  {
-    "model": "deepseek-ai/deepseek-v4-flash",
+    "model": "nvidia/nemotron-3-nano-30b-a3b",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
@@ -35,22 +40,37 @@
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "qwen/qwen3-next-80b-a3b-thinking",
+    "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "deepseek-ai/deepseek-v3.2",
+    "model": "openai/gpt-oss-20b",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "openai/gpt-oss-120b",
+    "model": "mistralai/mistral-nemotron",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   },
   {
-    "model": "google/gemma-4-31b-it",
+    "model": "moonshotai/kimi-k2.6",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
+    "model": "deepseek-ai/deepseek-v4-flash",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
+    "model": "meta/llama-3.3-70b-instruct",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-YOUR_KEY_HERE"
+  },
+  {
+    "model": "qwen/qwen3-next-80b-a3b-instruct",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-YOUR_KEY_HERE"
   }

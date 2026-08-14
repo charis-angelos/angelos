@@ -8,3 +8,10 @@ scripts/*.service
 target/
 .venv-openwebui/
 .webui_secret_key
+SOUL.md.*
+gateway-claude-code/sessions.json
+skills/agent-browser-cdp-recovery/SKILL.md
+skills/father-context/SKILL.md
+skills/youtube-operate/SKILL.md
+*.bak
+*.pyc
